@@ -4,6 +4,7 @@
 #include "Cmd.h"
 #include "pins.h"
 #include <Adafruit_SleepyDog.h>
+#include <PID_v1.h>
 
 /*
  * COMMANDS
@@ -29,10 +30,20 @@ uint8_t compressor_status = 0;
 uint8_t cold_bypass_status = 0;
 uint8_t heater_status = 0;
 uint8_t rtd_status = 0;
+uint8_t control_pin = 0;
 chamber_modes chamber_mode = MODE_STANDBY;
-float setpoint = 20.0;
-float process_variable = 0.;
+double setpoint = 20.0;
+double process_variable = 0.;
 char dummychar[2];
+
+// PID Setup
+double PID_output=0;
+double Kp=10000, Ki=500, Kd=0;
+PID myPID(&process_variable, &PID_output, &setpoint, Kp, Ki, Kd, DIRECT);
+
+int WindowSize = 5000;
+unsigned long windowStartTime;
+
 
 void read_rtd()
 {
@@ -141,6 +152,7 @@ void SetCoolMode(int arg_cnt, char **args)
    * on so we don't start cooling yet.
    */
   chamber_mode = MODE_COOLING;
+  control_pin = PIN_COLD_BYPASS;
   MasterOn(1, *dummychar);
   FansOn(1, *dummychar);
   HeaterOff();
@@ -159,6 +171,9 @@ void SetWarmMode(int arg_cnt, char **args)
   HeaterOff();
   CompressorOff();
   ColdBypassOff();
+  windowStartTime = millis();
+  myPID.SetOutputLimits(0, WindowSize);
+  myPID.SetMode(AUTOMATIC);
 }
 
 void SetTemperature(int arg_cnt, char **args)
@@ -172,6 +187,44 @@ void SetTemperature(int arg_cnt, char **args)
     setpoint += cmdStr2Num(args[2], 10) / 10;
   }
 }
+
+void SetKP(int arg_cnt, char **args)
+{
+  /*
+   * Set the KP Gain (temporary until unit restarts).
+   */
+  if (arg_cnt > 0 )
+  {
+    Kp = cmdStr2Num(args[1], 10);
+    Kp += cmdStr2Num(args[2], 10) / 10;
+  }
+}
+
+void SetKI(int arg_cnt, char **args)
+{
+  /*
+   * Set the KI Gain (temporary until unit restarts).
+   */
+  if (arg_cnt > 0 )
+  {
+    Ki = cmdStr2Num(args[1], 10);
+    Ki += cmdStr2Num(args[2], 10) / 10;
+  }
+}
+
+
+void SetKD(int arg_cnt, char **args)
+{
+  /*
+   * Set the KP Gain (temporary until unit restarts).
+   */
+  if (arg_cnt > 0 )
+  {
+    Kd = cmdStr2Num(args[1], 10);
+    Kd += cmdStr2Num(args[2], 10) / 10;
+  }
+}
+
 
 void SetStandbyMode(int arg_cnt, char **args)
 {
@@ -221,11 +274,22 @@ void SendStatus()
   Serial.print("\t");
   Serial.print(heater_status);
   Serial.print("\t");
-  Serial.println(fan_status);
+  Serial.print(fan_status);
+  Serial.print("\t");
+  Serial.print(Kp);
+  Serial.print("\t");
+  Serial.print(Ki);
+  Serial.print("\t");
+  Serial.print(Kd);
+  Serial.print("\t");
+  Serial.println(PID_output);
 }
 
 void setup()
 {
+
+  Serial.begin(9600);
+
   Watchdog.enable(4000);
 
   pinMode(PIN_MASTER_POWER, OUTPUT);
@@ -252,6 +316,9 @@ void setup()
   cmdAdd("SETTEMP", SetTemperature);
   cmdAdd("POWERON", MasterOn);
   cmdAdd("POWEROFF", MasterOff);
+  cmdAdd("SETKP", SetKP);
+  cmdAdd("SETKI", SetKI);
+  cmdAdd("SETKD", SetKD);
 }
 
 void RunCoolingControl()
@@ -261,10 +328,16 @@ void RunCoolingControl()
    */
   float control_setpoint = setpoint;
 
+  /*
   if (cold_bypass_status)
   {
-    control_setpoint -= 0.5;
+    control_setpoint += 0.05;
   }
+  else
+  {
+    control_setpoint -= 0.05;
+  }
+  */
 
   if (process_variable > control_setpoint)
   {
@@ -282,11 +355,16 @@ void RunWarmingControl()
   /*
    * Control logic in the warming mode
    */
+  /*
   float control_setpoint = setpoint;
 
   if (heater_status)
   {
-    control_setpoint += 0.5;
+    control_setpoint -= 0.2;
+  }
+  else
+  {
+    control_setpoint -= 0.0;
   }
 
   if (process_variable < control_setpoint)
@@ -298,6 +376,25 @@ void RunWarmingControl()
   {
     HeaterOff();
   }
+  */
+  myPID.Compute();
+  if (millis() - windowStartTime > WindowSize)
+  { //time to shift the Relay Window
+    windowStartTime += WindowSize;
+  }
+  /*
+  Serial.print("debug,");
+  Serial.print(millis());
+  Serial.print(",");
+  Serial.print(windowStartTime);
+  Serial.print(",");
+  Serial.print(WindowSize);
+  Serial.print(",");
+  Serial.println(PID_output);
+  */
+  if (PID_output < 500) HeaterOff();
+  if (PID_output > millis() - windowStartTime) HeaterOn();
+  else HeaterOff();
 }
 
 void loop()
@@ -312,9 +409,13 @@ void loop()
    * Process any serial commands
    */
 
+  static uint8_t status_counter = 0;
   Watchdog.reset();
 
-  SendStatus();
+  if (status_counter%10 == 0)
+  {
+    SendStatus();
+  }
   
   read_rtd();
   
@@ -322,11 +423,11 @@ void loop()
   {
   case MODE_COOLING:
     RunCoolingControl();
-    delay(1000);
+    delay(500);
     break;
   case MODE_WARMING:
     RunWarmingControl();
-    delay(1000);
+    //delay(10);
     break;
   default:
     break;
